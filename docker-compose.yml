@@ -1,0 +1,34 @@
+version: '3.8'
+
+# Define the volume you created in Portainer
+volumes:
+  model_request_data:
+    external: true
+
+services:
+  # 1. The SmollM2 Model Service
+  smollm2:
+    image: ai/smollm2:latest
+    container_name: smollm2_service
+    # This service is only accessible internally via the service name 'smollm2'
+    # We expose the port internally for the FastAPI app to use
+    expose:
+      - 8000 
+    restart: unless-stopped
+    # If the model requires specific environment variables or resources, add them here
+    # environment:
+    #   - HF_TOKEN=<Your_HuggingFace_Token_if_needed>
+
+  # 2. Your FastAPI Application Service
+  fastapi-app:
+    build: . # Build from the Dockerfile in the current directory
+    container_name: fastapi_chat_api
+    depends_on:
+      - smollm2 # Ensures the model starts before the chat API
+    # Map a host port (e.g., 8080) to the container's port 8000
+    ports:
+      - "8080:8000" 
+    restart: unless-stopped
+    volumes:
+      # Mount the Portainer volume to the internal log path defined in main.py
+      - model_request_data:/app/model_request_data/
