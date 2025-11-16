@@ -1,5 +1,26 @@
 version: '3.8'
 
+services:
+  # 1. Your single, user-facing FastAPI Application Service
+  fastapi-app:
+    # Use the current directory (where Dockerfile is) to build the image
+    build: . 
+    container_name: fastapi_chat_api
+    # This maps the host's port 8080 to the container's port 8000 (as defined in Dockerfile/CMD)
+    ports:
+      - "8080:8000"
+    restart: unless-stopped
+    # Include the volume definition if you still need it for logs/data
+    volumes:
+      # If you keep the volume, you need to define it at the top level (see below)
+      # - model_request_data:/app/model_request_data/
+      - ./data_logs:/app/model_request_data/ # A simpler, local mount for development
+
+# Define the volume if you still want to use a persistent volume like 'model_request_data'
+# volumes:
+#   model_request_data:
+#     external: trueversion: '3.8'
+
 # Define the volume you created in Portainer
 volumes:
   model_request_data:
