@@ -12,7 +12,7 @@ import datetime
 # NOTE: This path assumes a volume named 'data_logs' is mounted to /app/model_request_data/
 LOG_FILE_PATH = Path("/app/model_request_data/logs.jsonl") 
 MAX_FOLLOW_UP = 2 # Limit is 2 follow-ups after the initial query (3 total requests)
-# FIX APPLIED HERE: Changed port from 8000 to the model runner's actual listening port 12434
+# Model API URL is correct: smollm2 is the service name, 12434 is the internal port
 MODEL_API_URL = "http://smollm2:12434/v1/completions" 
 
 # --- Data Models ---
@@ -79,11 +79,9 @@ async def chat_endpoint(request: UserRequest):
 
     # 3. Call the SmollM2 Model API
     try:
-        # Use a reasonable timeout for LLM inference (60 seconds)
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        # TIMEOUT INCREASED to 180 seconds (3 minutes) to account for slow CPU/first inference run
+        async with httpx.AsyncClient(timeout=180.0) as client:
             payload = {
-                # Note: The 'model' key is often ignored by the Docker runner 
-                # since the model is specified via MODEL_NAME ENV
                 "model": "smollm2", 
                 "messages": model_messages, 
                 "max_tokens": 256 # Set a reasonable limit for small model
@@ -101,9 +99,9 @@ async def chat_endpoint(request: UserRequest):
         logging.error(f"Model API returned error: {e.response.text}")
         raise HTTPException(status_code=503, detail="Model service failed to respond with a 2xx status. Check model runner logs.")
     except Exception as e:
-        # This catches connection errors (e.g., wrong port, container down)
+        # This catches connection errors (e.g., wrong port, container down, or a timeout)
         logging.error(f"Connection error to model service: {e}")
-        raise HTTPException(status_code=503, detail="Cannot connect to the model service. Is the smollm2 container running or is the internal port correct?")
+        raise HTTPException(status_code=503, detail="Cannot connect to the model service. Is the smollm2 container running or is the internal port correct? (Check for timeouts due to slow CPU inference.)")
 
     # 4. Update History
     history.append(ConversationEntry(role="user", content=user_query))
