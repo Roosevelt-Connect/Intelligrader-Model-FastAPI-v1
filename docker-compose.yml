@@ -1,59 +1,87 @@
 version: '3.8'
 
-# --- Top-Level Volume Definitions ---
-volumes:
-  # 1. Volume created in Portainer
-  model_request_data:
-    external: true
-  
-  # 2. Local bind mount for logs
-  data_logs:
-    driver: local
-  
-  # 3. Volume for the Docker Model Runner
-  docker-model-runner-models:
-    external: true
-
-# --- Top-Level Services Definitions ---
 services:
-  # 1. The SmollM2 Model Service (Using the Model Runner)
-  smollm2:
-    # Use the official Docker Model Runner image
-    image: docker/model-runner:latest
-    container_name: smollm2_service
-    
-    # Pass the name of the model you pulled
+  ollama:
+    image: ollama/ollama:latest
+    container_name: intelligrader-ollama
+    restart: unless-stopped
+    volumes:
+      - ollama_data:/root/.ollama
     environment:
-      - MODEL_NAME=ai/smollm2:latest
-    
-    # Mount the model storage volume (using the mount syntax)
-    volumes:
-      - docker-model-runner-models:/model-storage
-      
-    # Expose the model runner's port internally
-    expose:
-      - 8000
-    restart: unless-stopped
+      - OLLAMA_HOST=0.0.0.0
+      - OLLAMA_NUM_PARALLEL=1
+      - OLLAMA_MAX_LOADED_MODELS=1
+      - OLLAMA_NUM_THREAD=4
+    deploy:
+      resources:
+        limits:
+          memory: 2.5G
+          cpus: '2.0'
+        reservations:
+          memory: 1.5G
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - intelligrader-network
 
-  # 2. Your FastAPI Application Service (User-facing API)
   fastapi-app:
-    build: . # Build from the Dockerfile in the current directory
-    container_name: fastapi_chat_api
-    depends_on:
-      - smollm2 # Ensures the model starts before the chat API
-    
-    # Map a host port (8080) to the container's port 8000
-    ports:
-      - "8080:8000"
-      
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: intelligrader-api
     restart: unless-stopped
-    
-    # Mount volumes using the correct syntax: volume_name:path_in_container
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-phi3:mini}
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '1.0'
+        reservations:
+          memory: 512M
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    networks:
+      - intelligrader-network
+
+  nginx:
+    image: nginx:alpine
+    container_name: intelligrader-nginx
+    restart: unless-stopped
+    depends_on:
+      - fastapi-app
+    ports:
+      - "80:80"
+      - "443:443"
     volumes:
-      # Portainer volume mount
-      - model_request_data:/app/model_request_data/
-      # Local bind mount
-      - ./data_logs:/app/data_logs/ # Adjusted path for clarity if different from model data
-      
-      # The fastapi-app doesn't need to mount the model-runner volume, 
-      # as it accesses the model via HTTP/port 8000, not the file system.
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: '0.5'
+    networks:
+      - intelligrader-network
+
+volumes:
+  ollama_data:
+    driver: local
+
+networks:
+  intelligrader-network:
+    driver: bridge

@@ -1,48 +1,26 @@
-# .github/workflows/deploy.yml
-name: Continuous Deployment via SSH
+name: Makeshift CI CD Pipeline
 
-# Triggers the workflow on pushes to the 'main' branch
 on:
   push:
-    branches:
-      - main
-
-# Ensure the workflow has permissions to check out the code
-permissions:
-  contents: read
+    branches: [ "main" ]  # Triggers every time you push to the main branch
 
 jobs:
   deploy:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted  # Targets your Lightsail server
     
     steps:
-      - name: 1. Checkout repository code
-        # Uses the built-in action to get your latest code
+      - name: Checkout Code
         uses: actions/checkout@v4
+        # This downloads your code into: 
+        # /home/ubuntu/actions-runner/_work/Intelligrader-API/Intelligrader-API
 
-      - name: 2. Deploy to Server via SSH
-        uses: appleboy/ssh-action@v1.0.1 # A popular action for running SSH commands
-        with:
-          # --- Authentication and Host ---
-          host: ${{ secrets.HOST_IP }}          # Uses the IP secret (e.g., 172.26.9.24)
-          username: ubuntu                      # Your server username
-          key: ${{ secrets.SSH_PRIVATE_KEY }}   # Uses the private key secret
-          script_stop: true                     # Stop the workflow if any command fails
+      - name: Deploy with Docker Compose
+        run: |
+          # 1. Build and restart containers in detached mode
+          docker compose up -d --build
           
-          # --- Deployment Commands ---
-          script: |
-            # 1. Change to the application directory on the server
-            cd ~/rc_model
-            
-            # 2. Pull the latest code from GitHub
-            git pull
-            
-            # 3. Use 'docker compose' to rebuild the service images and restart containers
-            #    - --build: Forces a rebuild of the 'fastapi-app' image
-            #    - -d: Runs the containers in detached mode (background)
-            docker compose up --build -d
-            
-            # 4. Clean up unused images to save disk space
-            docker image prune -f
-            
-            echo "Deployment successful on ${{ secrets.HOST_IP }}"
+          # 2. Clean up unused images to save disk space on Lightsail
+          docker image prune -f
+
+      - name: Status Check
+        run: docker ps

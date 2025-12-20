@@ -1,131 +1,309 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import Dict, List, Any
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from typing import Optional, List, Dict, Tuple
+import httpx
 import logging
-import json
-from pathlib import Path
-import httpx 
-import datetime
+import os
+from datetime import datetime
 
-# --- Configuration ---
-# Internal path must match the volume mapping in docker-compose.yml
-# NOTE: This path assumes a volume named 'data_logs' is mounted to /app/model_request_data/
-LOG_FILE_PATH = Path("/app/model_request_data/logs.jsonl") 
-MAX_FOLLOW_UP = 2 # Limit is 2 follow-ups after the initial query (3 total requests)
-# Model API URL is correct: smollm2 is the service name, 12434 is the internal port
-MODEL_API_URL = "http://smollm2:12434/v1/completions" 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-# --- Data Models ---
-class UserRequest(BaseModel):
-    session_id: str
-    user_query: str
+app = FastAPI(
+    title="AP FRQ Grading Service",
+    description="Production-grade service for grading AP Free Response Questions using Ollama",
+    version="1.0.0"
+)
 
-class SessionControl(BaseModel):
-    session_id: str
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Configure appropriately for production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-class ConversationEntry(BaseModel):
-    role: str # 'user' or 'model'
-    content: str
+# Configuration
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "phi3:mini")  # or smollm:latest
+TIMEOUT = 300  # 5 minutes for grading
+MAX_RETRIES = 3
+
+
+class GradingRequest(BaseModel):
+    """Request model for grading an FRQ."""
+    student_response: str = Field(..., description="The student's response to grade")
+    rubric: str = Field(..., description="The rubric/answer key for grading")
+    question_prompt: str = Field(..., description="The original question prompt")
+    max_points: int = Field(default=10, ge=1, le=100, description="Maximum points for this question")
+    question_number: Optional[str] = Field(None, description="Optional question identifier")
+
+
+class GradingResponse(BaseModel):
+    """Response model for grading results."""
+    score: float = Field(..., description="Numerical score awarded")
+    max_points: float = Field(..., description="Maximum possible points")
+    percentage: float = Field(..., description="Score as percentage")
+    feedback: str = Field(..., description="Detailed feedback for the student")
+    rubric_alignment: Dict[str, float] = Field(..., description="Alignment scores for each rubric criterion")
+    timestamp: str = Field(..., description="When the grading was performed")
+    question_number: Optional[str] = Field(None, description="Question identifier if provided")
+
+
+class HealthResponse(BaseModel):
+    """Health check response."""
+    status: str
+    ollama_available: bool
+    model: str
+
+
+async def call_ollama(prompt: str, system_prompt: str = None) -> str:
+    """
+    Call Ollama API with deterministic settings.
+    Uses low temperature and CPU-only inference.
+    """
+    url = f"{OLLAMA_BASE_URL}/api/generate"
     
-# --- In-Memory State Management ---
-# Session ID -> List of ConversationEntry objects
-conversation_history: Dict[str, List[ConversationEntry]] = {}
-
-app = FastAPI()
-
-# Ensure the log file directory exists for logging 
-LOG_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-# --- Logging Function ---
-def log_request_data(session_id: str, user_query: str, model_response: str):
-    """Writes request/response data to the mounted volume."""
-    try:
-        log_entry = {
-            "timestamp": datetime.datetime.now().isoformat(),
-            "session_id": session_id,
-            "user_query": user_query,
-            "model_response": model_response,
+    payload = {
+        "model": OLLAMA_MODEL,
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "temperature": 0.1,  # Low temperature for deterministic outputs
+            "top_p": 0.9,
+            "top_k": 40,
+            "num_predict": 2000,  # Limit response length
+            "repeat_penalty": 1.1,
+            "seed": 42,  # Deterministic seed
+            "num_thread": 4,  # CPU threads
+            "num_gpu": 0,  # CPU-only
         }
-        with open(LOG_FILE_PATH, "a") as f:
-            f.write(json.dumps(log_entry) + "\n")
-    except Exception as e:
-        logging.error(f"Failed to write to volume log: {e}")
-
-# --- API Endpoint ---
-@app.post("/chat/")
-async def chat_endpoint(request: UserRequest):
-    session_id = request.session_id
-    user_query = request.user_query
-    
-    # Get current history (Q/A pairs)
-    history = conversation_history.get(session_id, [])
-    
-    # 1. Check Follow-up Limit
-    user_request_count = len([e for e in history if e.role == 'user'])
-    
-    if user_request_count >= MAX_FOLLOW_UP + 1: # +1 includes the initial query
-        raise HTTPException(
-            status_code=400,
-            detail=f"Session limit of {MAX_FOLLOW_UP} follow-ups reached. Please call /new_session/ to start over."
-        )
-
-    # 2. Prepare Conversation Context (History + New Query)
-    # The 'messages' structure is critical for chat models
-    model_messages = [
-        {"role": entry.role, "content": entry.content} 
-        for entry in history
-    ]
-    model_messages.append({"role": "user", "content": user_query})
-
-    # 3. Call the SmollM2 Model API
-    try:
-        # TIMEOUT INCREASED to 180 seconds (3 minutes) to account for slow CPU/first inference run
-        async with httpx.AsyncClient(timeout=180.0) as client:
-            payload = {
-                "model": "smollm2", 
-                "messages": model_messages, 
-                "max_tokens": 256 # Set a reasonable limit for small model
-            }
-            
-            response = await client.post(MODEL_API_URL, json=payload)
-            response.raise_for_status()
-            
-            # Extract the response text (Standard OpenAI-style API response parsing)
-            model_response_data = response.json()
-            # The docker model runner uses the standard OpenAI response structure
-            model_response = model_response_data['choices'][0]['message']['content']
-            
-    except httpx.HTTPStatusError as e:
-        logging.error(f"Model API returned error: {e.response.text}")
-        raise HTTPException(status_code=503, detail="Model service failed to respond with a 2xx status. Check model runner logs.")
-    except Exception as e:
-        # This catches connection errors (e.g., wrong port, container down, or a timeout)
-        logging.error(f"Connection error to model service: {e}")
-        raise HTTPException(status_code=503, detail="Cannot connect to the model service. Is the smollm2 container running or is the internal port correct? (Check for timeouts due to slow CPU inference.)")
-
-    # 4. Update History
-    history.append(ConversationEntry(role="user", content=user_query))
-    history.append(ConversationEntry(role="model", content=model_response))
-    conversation_history[session_id] = history
-    
-    # 5. Collect Relevant Data (Log to Volume)
-    log_request_data(session_id, user_query, model_response)
-    
-    # Calculate follow-ups remaining
-    new_request_count = len([e for e in history if e.role == 'user'])
-    follow_ups_left = MAX_FOLLOW_UP - (new_request_count - 1)
-    
-    return {
-        "session_id": session_id, 
-        "response": model_response, 
-        "follow_ups_left": max(0, follow_ups_left)
     }
+    
+    if system_prompt:
+        payload["system"] = system_prompt
+    
+    for attempt in range(MAX_RETRIES):
+        try:
+            async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+                response = await client.post(url, json=payload)
+                response.raise_for_status()
+                result = response.json()
+                return result.get("response", "")
+        except httpx.TimeoutException:
+            logger.warning(f"Ollama request timeout (attempt {attempt + 1}/{MAX_RETRIES})")
+            if attempt == MAX_RETRIES - 1:
+                raise HTTPException(status_code=504, detail="Ollama service timeout")
+        except httpx.HTTPStatusError as e:
+            logger.error(f"Ollama HTTP error: {e}")
+            if attempt == MAX_RETRIES - 1:
+                raise HTTPException(status_code=502, detail=f"Ollama service error: {e}")
+        except Exception as e:
+            logger.error(f"Unexpected error calling Ollama: {e}")
+            if attempt == MAX_RETRIES - 1:
+                raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
+    
+    raise HTTPException(status_code=500, detail="Failed to call Ollama after retries")
 
-# Endpoint to clear a session
-@app.post("/new_session/")
-async def new_session_endpoint(request: SessionControl):
-    session_id_to_clear = request.session_id
-    if session_id_to_clear in conversation_history:
-        del conversation_history[session_id_to_clear]
-        return {"message": f"Session {session_id_to_clear} cleared. Ready for a new conversation."}
-    return {"message": "Session not found or already cleared."}
+
+def create_grading_prompt(student_response: str, rubric: str, question_prompt: str, max_points: int) -> Tuple[str, str]:
+    """
+    Create the grading prompt with rubric anchoring.
+    Returns (system_prompt, user_prompt) tuple.
+    """
+    system_prompt = """You are an expert AP exam grader. Your task is to grade student responses against a detailed rubric. 
+You must be precise, fair, and consistent. Always provide:
+1. A numerical score (0 to max_points)
+2. Detailed feedback explaining what the student did well and what needs improvement
+3. Specific references to rubric criteria and how the response aligns with each criterion
+
+Be deterministic and consistent. Similar responses should receive similar scores."""
+    
+    user_prompt = f"""Grade the following AP Free Response Question response.
+
+QUESTION PROMPT:
+{question_prompt}
+
+RUBRIC/ANSWER KEY:
+{rubric}
+
+STUDENT RESPONSE:
+{student_response}
+
+MAXIMUM POINTS: {max_points}
+
+Please provide your grading in the following JSON format:
+{{
+    "score": <numerical_score>,
+    "max_points": {max_points},
+    "feedback": "<detailed_feedback_explaining_the_score>",
+    "rubric_alignment": {{
+        "criterion_1": <score_0_to_1>,
+        "criterion_2": <score_0_to_1>,
+        ...
+    }}
+}}
+
+The rubric_alignment should break down how well the response meets each key criterion from the rubric. Each value should be between 0.0 and 1.0.
+
+IMPORTANT: 
+- Be strict but fair
+- Reference specific parts of the student response
+- Explain how the response aligns with the rubric
+- Provide actionable feedback"""
+    
+    return system_prompt, user_prompt
+
+
+def parse_grading_response(llm_response: str, max_points: float, question_number: Optional[str] = None) -> GradingResponse:
+    """
+    Parse the LLM response and extract grading information.
+    Handles both JSON and text responses.
+    """
+    import json
+    import re
+    
+    # Try to extract JSON from the response
+    json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', llm_response, re.DOTALL)
+    
+    if json_match:
+        try:
+            data = json.loads(json_match.group(0))
+            score = float(data.get("score", 0))
+            feedback = data.get("feedback", llm_response)
+            rubric_alignment = data.get("rubric_alignment", {})
+            
+            # Ensure score is within bounds
+            score = max(0, min(score, max_points))
+            percentage = (score / max_points) * 100 if max_points > 0 else 0
+            
+            return GradingResponse(
+                score=score,
+                max_points=max_points,
+                percentage=round(percentage, 2),
+                feedback=feedback,
+                rubric_alignment=rubric_alignment,
+                timestamp=datetime.utcnow().isoformat(),
+                question_number=question_number
+            )
+        except json.JSONDecodeError:
+            logger.warning("Failed to parse JSON from LLM response, using fallback parsing")
+    
+    # Fallback: extract score from text
+    score_match = re.search(r'score[:\s]+(\d+\.?\d*)', llm_response, re.IGNORECASE)
+    score = float(score_match.group(1)) if score_match else 0.0
+    score = max(0, min(score, max_points))
+    percentage = (score / max_points) * 100 if max_points > 0 else 0
+    
+    return GradingResponse(
+        score=score,
+        max_points=max_points,
+        percentage=round(percentage, 2),
+        feedback=llm_response,
+        rubric_alignment={"overall": score / max_points if max_points > 0 else 0},
+        timestamp=datetime.utcnow().isoformat(),
+        question_number=question_number
+    )
+
+
+@app.get("/", response_model=HealthResponse)
+async def root():
+    """Root endpoint with health check."""
+    ollama_available = False
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(f"{OLLAMA_BASE_URL}/api/tags")
+            ollama_available = response.status_code == 200
+    except Exception as e:
+        logger.warning(f"Ollama health check failed: {e}")
+    
+    return HealthResponse(
+        status="healthy",
+        ollama_available=ollama_available,
+        model=OLLAMA_MODEL
+    )
+
+
+@app.get("/health", response_model=HealthResponse)
+async def health():
+    """Health check endpoint."""
+    return await root()
+
+
+@app.post("/grade", response_model=GradingResponse)
+async def grade_frq(request: GradingRequest):
+    """
+    Grade an AP FRQ response using the rubric.
+    
+    This endpoint uses Ollama to perform rubric-anchored grading with:
+    - Low temperature (0.1) for deterministic outputs
+    - CPU-only inference
+    - Detailed feedback and rubric alignment scores
+    """
+    try:
+        logger.info(f"Grading request received for question: {request.question_number or 'N/A'}")
+        
+        # Create grading prompt with rubric anchoring
+        system_prompt, user_prompt = create_grading_prompt(
+            request.student_response,
+            request.rubric,
+            request.question_prompt,
+            request.max_points
+        )
+        
+        # Call Ollama
+        llm_response = await call_ollama(user_prompt, system_prompt)
+        
+        # Parse and return response
+        grading_result = parse_grading_response(
+            llm_response,
+            request.max_points,
+            request.question_number
+        )
+        
+        logger.info(f"Grading completed: {grading_result.score}/{grading_result.max_points}")
+        
+        return grading_result
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error grading FRQ: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Grading failed: {str(e)}")
+
+
+@app.post("/grade/batch", response_model=List[GradingResponse])
+async def grade_batch(requests: List[GradingRequest]):
+    """
+    Grade multiple FRQ responses in batch.
+    Processes sequentially to manage memory usage.
+    """
+    results = []
+    for req in requests:
+        try:
+            result = await grade_frq(req)
+            results.append(result)
+        except Exception as e:
+            logger.error(f"Error grading batch item: {e}")
+            # Create error response
+            results.append(GradingResponse(
+                score=0.0,
+                max_points=req.max_points,
+                percentage=0.0,
+                feedback=f"Error during grading: {str(e)}",
+                rubric_alignment={},
+                timestamp=datetime.utcnow().isoformat(),
+                question_number=req.question_number
+            ))
+    return results
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
