@@ -1,4 +1,4 @@
-name: Makeshift CI CD Pipeline
+name: CI-CD Deployment Pipeline
 
 on:
   push:
