@@ -16,10 +16,10 @@ jobs:
 
       - name: Deploy with Docker Compose
         run: |
-          # 1. Build and restart containers in detached mode
+          docker compose down --remove-orphans
+          
           docker compose up -d --build
           
-          # 2. Clean up unused images to save disk space on Lightsail
           docker image prune -f
 
       - name: Status Check
