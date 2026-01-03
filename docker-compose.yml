@@ -5,6 +5,13 @@ services:
     build: .
     container_name: intelligrader-api
     restart: unless-stopped
+    volumes:
+      - /path/to/your/model.gguf:/app/models/model.gguf:ro
+    environment:
+      - MODEL_PATH=/app/models/model.gguf
+      - MAX_THREADS=4
+      - CONTEXT_SIZE=2048
+      - MAX_TOKENS=512
     networks:
       - web_network
 
