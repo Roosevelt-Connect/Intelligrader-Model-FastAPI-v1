@@ -38,15 +38,6 @@ def health():
     model_status = "loaded" if llm is not None else "not loaded"
     return {"status": "healthy", "model": model_status}
 
-@app.get("/add")
-def add_parameters(parameter1: float, parameter2: float):
-    try:
-        result = parameter1 + parameter2
-        return {"result": result}
-    except (TypeError, ValueError) as e:
-        # HTTP 400 (bad request) with error details.
-        raise HTTPException(status_code=400, detail=f"Invalid input: {str(e)}")
-
 @app.post("/generate")
 def generate_text(request: GenerateRequest):
     if llm is None:
