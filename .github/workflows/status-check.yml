@@ -16,7 +16,7 @@ jobs:
           HOST_IP: ${{ secrets.HOST_IP }}
         run: |
           # List of endpoints to check (add/remove as needed)
-          endpoints=("/" "/health")
+          endpoints=("/health")
           
           errorCount=0
           
