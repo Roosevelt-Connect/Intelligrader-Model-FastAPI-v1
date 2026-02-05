@@ -2,9 +2,16 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 from llama_cpp import Llama
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from fastapi.exceptions import RequestValidationError
 import os
 
+limiter = Limiter(key_func=get_remote_address)
 app = FastAPI()
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, lambda request, exc: HTTPException(status_code=429, detail="Rate limit exceeded: 10 requests per hour"))
 
 # Load the GGUF model
 model_path = "./models/SmolLM2-Rethink-360M.F32.gguf"
@@ -31,15 +38,18 @@ class GenerateRequest(BaseModel):
     top_p: float = 0.9
 
 @app.get("/")
-def root():
+@limiter.limit("10/hour")
+def root(request):
     return RedirectResponse(url="/generate")
 
 @app.get("/health")
-def health():
+@limiter.limit("3/hour")
+def health(request):
     model_status = "loaded" if llm is not None else "not loaded"
     return {"status": "healthy", "model": model_status}
 
 @app.post("/generate")
+@limiter.limit("10/hour")
 def generate_text(request: GenerateRequest):
     if llm is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
